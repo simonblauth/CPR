@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pytorch-cpr"
+version = "0.1.0"
+authors = [
+  { name="Jörg Franke", email="frankej@cs.uni-freiburg.de" },
+]
+description = "Constrained Parameter Regularization for PyTorch"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+full = [
+    'pytorch>=2.0.0',
+]
+
+[project.urls]
+Homepage = "https://github.com/automl/CPR"
