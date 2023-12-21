@@ -1,7 +1,9 @@
 
 # Constrained Parameter Regularization
 
-This repository contains the PyTorch implementation of **Constrained Parameter Regularization**.
+This repository contains the PyTorch implementation of [**Constrained Parameter Regularization**](https://arxiv.org/abs/2311.09058).
+
+
 
 
 ## Install
@@ -105,11 +107,11 @@ python examples/train_resnet.py --optimizer adamcpr --lr 0.001 --kappa_init_meth
 
 ## Citation
 
-Please cite our paper if you use this code in your own work:
+Please cite our paper if you use this code in your work:
     
 ```
-@misc{franke2023new,
-      title={New Horizons in Parameter Regularization: A Constraint Approach}, 
+@misc{franke2023cpr,
+      title={Constrained Parameter Regularization}, 
       author={Jörg K. H. Franke and Michael Hefenbrock and Gregor Koehler and Frank Hutter},
       year={2023},
       eprint={2311.09058},
