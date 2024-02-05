@@ -9,7 +9,7 @@ This repository contains the PyTorch implementation of [**Constrained Parameter 
 ## Install
 
 ```bash
-pip install pytroch-cpr
+pip install pytorch-cpr
 ```
 
 ## Getting started
