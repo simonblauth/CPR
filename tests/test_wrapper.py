@@ -18,7 +18,7 @@ def test_apply_cpr_with_sgd():
 
     # Test the apply_CPR functionality with SGD
     # Ensure CPR optimizer is correctly initialized
-    assert cpr_optimizer.base_optimizer.__class__ == SGD, "Base optimizer is not SGD"
+    assert cpr_optimizer.base_optim.__class__ == SGD, "Base optimizer is not SGD"
     assert cpr_optimizer.kappa_init_param == 0.1, "Incorrect initialization of kappa_init_param"
 
 
@@ -36,5 +36,5 @@ def test_apply_cpr_with_adam():
 
     # Test the apply_CPR functionality with Adam
     # Ensure CPR optimizer is correctly initialized
-    assert cpr_optimizer.base_optimizer.__class__ == Adam, "Base optimizer is not Adam"
+    assert cpr_optimizer.base_optim.__class__ == Adam, "Base optimizer is not Adam"
     assert cpr_optimizer.kappa_init_param == 0.1, "Incorrect initialization of kappa_init_param"

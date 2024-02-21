@@ -264,7 +264,7 @@ class ResNetModule(pl.LightningModule):
         elif self.cfg.optimizer == 'adamcpr':
             optimizer = apply_CPR(self.model, torch.optim.Adam, self.cfg.kappa_init_param, self.cfg.kappa_init_method,
                                   self.cfg.reg_function,
-                                  self.cfg.kappa_adapt, self.cfg.kappa_update, self.cfg.apply_lr,
+                                  self.cfg.kappa_adapt, self.cfg.kappa_update,
                                   embedding_regularization=True,
                                   lr=self.cfg.lr, betas=(self.cfg.beta1, self.cfg.beta2))
 
@@ -355,7 +355,7 @@ def train_cifar100_task(config):
     expt_dir.mkdir(parents=True, exist_ok=True)
 
     if config.optimizer == "adamcpr":
-        expt_name = f"{config.optimizer}_p{config.kappa_init_param}_m{config.kappa_init_method}_kf{config.reg_function}_r{config.kappa_update}_l{config.lr}_adapt{config.kappa_adapt}_g{config.apply_lr}"
+        expt_name = f"{config.optimizer}_p{config.kappa_init_param}_m{config.kappa_init_method}_kf{config.reg_function}_r{config.kappa_update}_l{config.lr}_adapt{config.kappa_adapt}"
     else:
         expt_name = f"{config.optimizer}_l{config.lr}_w{config.weight_decay}_re{config.rescale_alpha}_swd{config.schedule_weight_decay}_swds{config.wd_scale}_t{config.wd_schedule_type}"
 
@@ -414,7 +414,6 @@ if __name__ == "__main__":
     parser.add_argument("--reg_function", type=str, default='l2')
     parser.add_argument("--kappa_update", type=float, default=1.0)
     parser.add_argument("--kappa_adapt", action=argparse.BooleanOptionalAction)
-    parser.add_argument("--apply_lr", action=argparse.BooleanOptionalAction)
 
     parser.add_argument("--start_epoch", type=int, default=1)
 
@@ -426,7 +425,6 @@ if __name__ == "__main__":
 
     args.schedule_weight_decay = args.schedule_weight_decay == 1
     args.kappa_adapt = args.kappa_adapt == 1
-    args.apply_lr = args.apply_lr == 1
 
     print(args.__dict__)
 

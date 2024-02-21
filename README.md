@@ -25,7 +25,6 @@ The `apply_CPR` function is a wrapper designed to apply CPR (Constrained Paramet
 - `reg_function` (default `'l2'`): The regularization function to be applied. Options include `'l2'` or `'std'`.
 - `kappa_adapt` (default `False`): Flag to determine if kappa should adapt during training.
 - `kappa_update` (default `1.0`): The rate at which kappa is updated in the Lagrangian method.
-- `apply_lr` (default `False`): Flag to apply learning rate for the regularization update.
 - `normalization_regularization` (default `False`): Flag to apply regularization to normalization layers.
 - `bias_regularization` (default `False`): Flag to apply regularization to bias parameters.
 - `embedding_regularization` (default `False`): Flag to apply regularization to embedding parameters.

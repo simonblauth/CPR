@@ -64,13 +64,13 @@ def cpr_group_named_parameters(model, optim_hps, avoid_keywords=[],
 
     if not apply_no_decay:
         param_groups = [{"params": [param_dict[pn] for pn in sorted(apply_decay)],
-                         "names": [pn for pn in sorted(apply_decay)], "apply_decay": True, **optim_hps}]
+                         "names": [pn for pn in sorted(apply_decay)], "apply_cpr": True, **optim_hps}]
     else:
         param_groups = [
             {"params": [param_dict[pn] for pn in sorted(list(apply_decay))],
-             "names": [pn for pn in sorted(list(apply_decay))], "apply_decay": True, **optim_hps},
+             "names": [pn for pn in sorted(list(apply_decay))], "apply_cpr": True, **optim_hps},
             {"params": [param_dict[pn] for pn in sorted(list(apply_no_decay))],
-             "names": [pn for pn in sorted(list(apply_no_decay))], "apply_decay": False, **optim_hps},
+             "names": [pn for pn in sorted(list(apply_no_decay))], "apply_cpr": False, **optim_hps},
         ]
     # Add parameters with special hyperparameters
     # Unique dicts

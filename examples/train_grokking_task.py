@@ -131,7 +131,7 @@ def train_grokking(config):
     if config.optimizer == 'adamcpr':
         optimizer = apply_CPR(model, torch.optim.Adam, config.kappa_init_param, config.kappa_init_method,
                               config.reg_function,
-                              config.kappa_adapt, config.kappa_update, config.apply_lr,
+                              config.kappa_adapt, config.kappa_update,
                               normalization_regularization=False, bias_regularization=False,
                               embedding_regularization=True,
                               lr=config.lr, betas=(config.beta1, config.beta2))
@@ -217,7 +217,7 @@ def train_grokking(config):
                 stats['steps'].append(steps)
 
                 if config.optimizer == "adamcpr":
-                    for group, group_states in zip(optimizer.base_optimizer.param_groups, optimizer.cpr_states):
+                    for group, group_states in zip(optimizer.base_optim.param_groups, optimizer.cpr_states):
                         if 'apply_decay' in group and group['apply_decay'] is True:
                             for name, state in zip(group['names'], group_states):
                                 lagmul = state['lagmul']
@@ -242,7 +242,7 @@ def train_grokking(config):
 
     task_name = f"{config.epochs}_{str(int(config.seed))}_p{config.p}_f{config.train_fraction}"
     if config.optimizer == "adamcpr":
-        expt_name = f"{config.optimizer}_p{config.kappa_init_param}_m{config.kappa_init_method}_kf{config.reg_function}_r{config.kappa_update}_l{config.lr}_adapt{config.kappa_adapt}_g{config.apply_lr}"
+        expt_name = f"{config.optimizer}_p{config.kappa_init_param}_m{config.kappa_init_method}_kf{config.reg_function}_r{config.kappa_update}_l{config.lr}_adapt{config.kappa_adapt}"
     else:
         expt_name = f"{config.optimizer}_w{config.weight_decay}_re{config.rescale_alpha}_l{config.lr}"
 
@@ -352,7 +352,6 @@ if __name__ == "__main__":
     parser.add_argument("--reg_function", type=str, default='l2')
     parser.add_argument("--kappa_update", type=float, default=1.0)
     parser.add_argument("--kappa_adapt", type=bool, default=True)
-    parser.add_argument("--apply_lr", type=bool, default=False)
 
     parser.add_argument("--log_interval", type=int, default=5)
     parser.add_argument("--output_dir", type=str, default='grokking')
