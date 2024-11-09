@@ -7,9 +7,9 @@ import numpy as np
 from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 
-from pytorch_cpr import apply_CPR
+from pytorch_cpr import AdamCPR
 
-### Data
+### Data generation
 def modular_addition(p, train_fraction, train_shuffle, device):
     equals_token = p
     x, y = torch.meshgrid(torch.arange(p), torch.arange(p), indexing='ij')
@@ -95,15 +95,6 @@ def init_params(model, model_dim, vocab_dim, init_type='xavier'):
             nn.init.constant_(param, 0)
 
 
-def print_param_groups(param_groups):
-    for param_group in param_groups:
-        if 'apply_decay' in param_group:
-            print(f"### PARAM GROUP #### apply_decay: {param_group['apply_decay']}")
-        else:
-            print(f"### PARAM GROUP #### weight_decay: {param_group['weight_decay']}")
-        for name, param in zip(param_group['names'], param_group['params']):
-            print(
-                f"{name:60} {param.shape[0]:4} {param.shape[-1]:4} std {param.std():.3f} l2m {param.square().mean():.3f}")
 
 
 ### Main
@@ -129,12 +120,9 @@ def train_grokking(config):
     init_params(model, config.model_dim, config.p, init_type=config.init_type)
 
     if config.optimizer == 'adamcpr':
-        optimizer = apply_CPR(model, torch.optim.Adam, config.kappa_init_param, config.kappa_init_method,
-                              config.reg_function,
-                              config.kappa_adapt, config.kappa_update,
-                              normalization_regularization=False, bias_regularization=False,
-                              embedding_regularization=True,
-                              lr=config.lr, betas=(config.beta1, config.beta2))
+        optimizer = AdamCPR(model, lr=config.lr, betas=(config.beta1, config.beta2), kappa_init_param=config.kappa_init_param,
+                            kappa_init_method=config.kappa_init_method, reg_function=config.reg_function,
+                            kappa_update=config.kappa_update, reg_embedding=True)
         param_groups = optimizer.state_dict()['param_groups']
         params = list(model.parameters())
         for param_group in param_groups:
@@ -159,9 +147,6 @@ def train_grokking(config):
         else:
             param_groups = model.parameters()
         optimizer = torch.optim.AdamW(param_groups, lr=config.lr, betas=(config.beta1, config.beta2))
-
-    if config.print:
-        print_param_groups(param_groups)
 
     if config.rescale_alpha > 0:
         with torch.no_grad():
@@ -216,28 +201,22 @@ def train_grokking(config):
                     torch.sqrt(sum(param.pow(2).sum() for param in model.parameters())).cpu().numpy())
                 stats['steps'].append(steps)
 
-                if config.optimizer == "adamcpr":
-                    for group, group_states in zip(optimizer.base_optim.param_groups, optimizer.cpr_states):
-                        if 'apply_decay' in group and group['apply_decay'] is True:
-                            for name, state in zip(group['names'], group_states):
-                                lagmul = state['lagmul']
-                                kappa = state['kappa']
-                                step = state['step']
-                                stats[f"cpr/{name}/lambda"].append(lagmul.item())
-                                stats[f"cpr/{name}/kappa"].append(kappa.item())
-                                stats[f"cpr/{name}/step"].append(step.item())
-
                 totalnorm = []
-                for param_group in optimizer.param_groups:
-                    for name, param in zip(param_group['names'], param_group['params']):
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
                         stats[f"params/{name}/mean"].append(param.mean().item())
                         stats[f"params/{name}/std"].append(param.std().item())
                         stats[f"params/{name}/l2"].append(param.pow(2).sum().item())
                         stats[f"params/{name}/l2m"].append(param.pow(2).mean().item())
                         stats[f"params/{name}/l2s"].append(param.pow(2).sum().item())
                         totalnorm.append(param.pow(2).sum().item())
+                        if config.optimizer == "adamcpr":
+                            state = optimizer.state[param]
+                            if state['regularize']:
+                                stats[f"cpr/{name}/lagmul"] = state['lagmul'].item()
+                                stats[f"cpr/{name}/kappa"] = state['kappa'].item()
+                                stats[f"cpr/{name}/step"] = state['step'].item()
                 stats[f"params/total_norm"].append(np.sqrt(sum(totalnorm)))
-
         steps += 1
 
     task_name = f"{config.epochs}_{str(int(config.seed))}_p{config.p}_f{config.train_fraction}"
@@ -260,7 +239,10 @@ def train_grokking(config):
         os.makedirs(config.output_dir + f"/{config.session}_figures", exist_ok=True)
 
         if config.plot_norms:
-            name_constrained_weights = param_groups[0]['names']
+            name_constrained_weights = []
+            for name, param in model.named_parameters():
+                if param.requires_grad and "weight" in name:
+                    name_constrained_weights.append(name)
             plot_rows = 1 + len(name_constrained_weights)
 
             fig, ax = plt.subplots(plot_rows, 1, sharex=True, squeeze=True, figsize=(16, 12))
@@ -326,7 +308,7 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--session", type=str, default='test_grokking')
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--epochs", type=int, default=4000)
+    parser.add_argument("--epochs", type=int, default=1000)
 
     parser.add_argument("--p", type=int, default=113)
     parser.add_argument("--train_shuffle", type=bool, default=True)
@@ -354,7 +336,7 @@ if __name__ == "__main__":
     parser.add_argument("--kappa_adapt", type=bool, default=True)
 
     parser.add_argument("--log_interval", type=int, default=5)
-    parser.add_argument("--output_dir", type=str, default='grokking')
+    parser.add_argument("--output_dir", type=str, default='experiments/grokking')
     parser.add_argument("--plot", type=bool, default=True)
     parser.add_argument("--show_plot", type=bool, default=True)
     parser.add_argument("--print", type=bool, default=True)

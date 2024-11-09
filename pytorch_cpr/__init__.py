@@ -1,3 +1,2 @@
-from .group_parameter import cpr_group_named_parameters
-from .optim_cpr import CPR
-from .wrapper import apply_CPR
+from .adamcpr import AdamCPR
+from .group_parameter import group_parameters_for_cpr_optimizer

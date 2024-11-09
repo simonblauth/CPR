@@ -9,72 +9,15 @@ import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
-from pytorch_lightning import Callback
 from pytorch_lightning.callbacks import LearningRateMonitor
 
-from pytorch_cpr import apply_CPR
+
+from pytorch_cpr import AdamCPR
 
 torch.set_float32_matmul_precision('high')
 
-class WeightDecayScheduler(Callback):
+### Dataset
 
-    def __init__(self, schedule_weight_decay: bool, schedule_type: str, scale: float):
-        super().__init__()
-        self.schedule_weight_decay = schedule_weight_decay
-
-        self.schedule_type = schedule_type
-
-        self.decay = scale
-
-        self._step_count = 0
-
-    @staticmethod
-    def get_scheduler(schedule_type, num_warmup_steps, decay_factor, num_training_steps):
-        def fn_scheduler(current_step: int):
-            if current_step < num_warmup_steps:
-                return float(current_step) / float(max(1, num_warmup_steps))
-            elif schedule_type == 'linear':
-                return (decay_factor + (1 - decay_factor) *
-                        max(0.0, float(num_training_steps - num_warmup_steps - current_step) / float(
-                            max(1, num_training_steps - num_warmup_steps))))
-            elif schedule_type == 'cosine':
-                return (decay_factor + (1 - decay_factor) *
-                        max(0.0, (1 + math.cos(math.pi * (current_step - num_warmup_steps) / float(
-                            max(1, num_training_steps - num_warmup_steps)))) / 2))
-            elif schedule_type == 'const':
-                return 1.0
-
-        return fn_scheduler
-
-    def on_fit_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"):
-        self.num_training_steps = trainer.max_steps
-
-        self.weight_decay = []
-        for optim in trainer.optimizers:
-            for group_idx, group in enumerate(optim.param_groups):
-                if 'weight_decay' in group:
-                    self.weight_decay.append(group['weight_decay'])
-
-        num_warmup_steps = 0
-
-        self.scheduler = self.get_scheduler(self.schedule_type, num_warmup_steps, self.decay, self.num_training_steps)
-
-    def on_before_optimizer_step(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", optimizer):
-
-        if self.schedule_weight_decay:
-            stats = {}
-            for group_idx, group in enumerate(optimizer.param_groups):
-                if 'weight_decay' in group:
-                    group['weight_decay'] = self.weight_decay[group_idx] * self.scheduler(self._step_count)
-                    stats[f"weight_decay/rank_{trainer.local_rank}/group_{group_idx}"] = group['weight_decay']
-
-            if trainer.loggers is not None:
-                for logger in trainer.loggers:
-                    logger.log_metrics(stats, step=trainer.global_step)
-            self._step_count += 1
-
-
-### Data
 def cifar100_task(cache_dir='./data'):
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
@@ -262,11 +205,10 @@ class ResNetModule(pl.LightningModule):
             param_groups = wd_group_named_parameters(self.model, weight_decay=self.cfg.weight_decay)
             optimizer = torch.optim.AdamW(param_groups, lr=self.cfg.lr, betas=(self.cfg.beta1, self.cfg.beta2))
         elif self.cfg.optimizer == 'adamcpr':
-            optimizer = apply_CPR(self.model, torch.optim.Adam, self.cfg.kappa_init_param, self.cfg.kappa_init_method,
-                                  self.cfg.reg_function,
-                                  self.cfg.kappa_adapt, self.cfg.kappa_update,
-                                  embedding_regularization=True,
-                                  lr=self.cfg.lr, betas=(self.cfg.beta1, self.cfg.beta2))
+            optimizer = AdamCPR(self.model, lr=self.cfg.lr, betas=(self.cfg.beta1, self.cfg.beta2),
+                                kappa_init_param=self.cfg.kappa_init_param,
+                                kappa_init_method=self.cfg.kappa_init_method, reg_function=self.cfg.reg_function,
+                                kappa_update=self.cfg.kappa_update, reg_embedding=True)
 
         if self.cfg.rescale_alpha > 0.0:
             with torch.no_grad():
@@ -324,6 +266,19 @@ class ResNetModule(pl.LightningModule):
                 for n, p in self.model.named_parameters():
                     if n.endswith("weight"):
                         p.data *= self.rescale_norm / new_norm
+
+
+
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and len(param.shape) >= 2:
+                self.log(f"params/{name}/mean", param.mean().item())
+                self.log(f"params/{name}/std", param.std().item())
+                self.log(f"params/{name}/l2", param.pow(2).sum().item())
+                if self.cfg.optimizer == 'adamcpr':
+                    state = self.trainer.optimizers[0].state[param]
+                    if 'kappa' in state:
+                        self.log(f"cpr/{name}/lagmul", state['lagmul'].item())
+                        self.log(f"cpr/{name}/kappa", state['kappa'].item())
         return loss
 
     def test_step(self, batch, batch_idx):
@@ -373,7 +328,6 @@ def train_cifar100_task(config):
 
     callbacks = [
         LearningRateMonitor(logging_interval='step'),
-        WeightDecayScheduler(config.schedule_weight_decay, schedule_type=config.wd_schedule_type, scale=config.wd_scale)
     ]
 
     trainer = pl.Trainer(devices=devices, accelerator="gpu", max_steps=config.max_train_steps,
@@ -405,21 +359,21 @@ if __name__ == "__main__":
     parser.add_argument("--wd_schedule_type", type=str, default='cosine')
     parser.add_argument("--wd_scale", type=float, default=0.1)
 
-    parser.add_argument("--lr_warmup_steps", type=int, default=200)
+    parser.add_argument("--lr_warmup_steps", type=int, default=500)
     parser.add_argument("--lr_decay_factor", type=float, default=0.1)
     parser.add_argument("--rescale_alpha", type=float, default=0)
 
     parser.add_argument("--kappa_init_param", type=float, default=1000)
-    parser.add_argument("--kappa_init_method", type=str, default='warm_start')
+    parser.add_argument("--kappa_init_method", type=str, default='inflection_point')
     parser.add_argument("--reg_function", type=str, default='l2')
     parser.add_argument("--kappa_update", type=float, default=1.0)
     parser.add_argument("--kappa_adapt", action=argparse.BooleanOptionalAction)
 
     parser.add_argument("--start_epoch", type=int, default=1)
 
-    parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument("--log_interval", type=int, default=20)
     parser.add_argument("--enable_progress_bar", type=bool, default=True)
-    parser.add_argument("--output_dir", type=str, default='cifar100')
+    parser.add_argument("--output_dir", type=str, default='experiments/cifar100')
     parser.add_argument("--device", type=int, default=0)
     args = parser.parse_args()
 
