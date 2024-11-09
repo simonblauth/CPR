@@ -4,7 +4,7 @@
 This repository contains the PyTorch implementation of [**Constrained Parameter Regularization**](https://arxiv.org/abs/2311.09058)(CPR) with the Adam optimizer.
 CPR is an alternative to traditional weight decay. Unlike the uniform application of a single penalty, CPR enforces an upper bound on a statistical measure, such as the L2-norm, of individual parameter matrices. CPR introduces only a minor runtime overhead and only requires setting an upper bound (or does it automatically with an inflection point detection). 
 
-AdamCPR outperforms AdamW on various tasks, such as imagenet (CIFAR100 and ImageNet) or language modeling (GPT2/OpenWebText) as in the figure below.
+AdamCPR outperforms AdamW on various tasks, such as image classification (CIFAR100 and ImageNet) or language modeling finetuning or pretraining (GPT2/OpenWebText) as in the figure below.
 
 <img src="figures/gpt2s_adamw200_300_cprIP.jpg" width="390" height="240">
 
