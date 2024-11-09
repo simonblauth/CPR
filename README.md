@@ -6,7 +6,7 @@ CPR is an alternative to traditional weight decay. Unlike the uniform applicatio
 
 AdamCPR outperforms AdamW on various tasks, such as imagenet (CIFAR100 and ImageNet) or language modeling (GPT2/OpenWebText) as in the figure below.
 
-<img src="figures/gpt2s_adamw200_300_cprIP.jpg width="390" height="240">
+<img src="figures/gpt2s_adamw200_300_cprIP.jpg" width="390" height="240">
 
 We see a GPT2s model trained on OpenWebText with AdamW for 200k steps (blue) and 300k steps (purple) vs. AdamCPR with inflection point detection (green). The CPR model converges more linear and achieves a lower validation perplexity, equivalent to training 50% longer with AdamW.
 Please find more experiments in our [paper](https://arxiv.org/abs/2311.09058). 
@@ -17,7 +17,7 @@ With CPR, learning becomes a constraint optimization problem, which we tackle us
 We implement this by adding a Lagrange multiplier $\lambda$ (scalar) and an upper bound $\kappa$ (scalar) for each parameter matrix $W$ in the model and update them each optimization step. We introduce four techniques for initializing the upper bound: `'uniform'` with a fixed value ,`'depended'` on the initial parameter norm, `'warm_start'` based on the norm after X training steps and a `'inflection_point'` detection-based method which doesn't require any additional hyperparameter for the regularization.
 We implement this Lagrange optimization directly in the Adam optimizer, which we call AdamCPR:
 
-<img src="figures/adamcpr.jpg width="852" height="439">
+<img src="figures/adamcpr.jpg" width="852" height="439">
 
 
 
