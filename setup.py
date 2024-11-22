@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='pytorch-cpr',
-    version='0.3.0',
+    version='0.3.1',
     description='Constrained Parameter Regularization for PyTorch',
     url='https://github.com/automl/CPR',
     author='Joerg Franke',

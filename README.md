@@ -84,11 +84,6 @@ To replicate the results in the paper, run variations with the following argumen
 python examples/train_grokking_task.py --optimizer adamw --weight_decay 0.1
 ```
 
-####  For Adam + Rescaling:
-```bash
-python examples/train_grokking_task.py --optimizer adamw --weight_decay 0.0 --rescale 0.8
-```
-
 ####  For AdamCPR with L2 norm as regularization function:
 ```bash
 python examples/train_grokking_task.py --optimizer adamcpr --kappa_init_method dependent --kappa_init_param 0.8
@@ -143,9 +138,9 @@ Please cite our paper if you use CPR in your work:
 ```
 @misc{franke2024cpr,
       title={Improving Deep Learning Optimization through Constrained Parameter Regularization}, 
-      author={Jörg K. H. Franke and Michael Hefenbrock and Gregor Koehler and Frank Hutter},
+      author={Jörg K. H. Franke and Michael Hefenbrock and Gregor Köhler and Frank Hutter},
       journal={Advances in Neural Information Processing Systems},
-      volume={37},
+      volume={38},
       year={2024},
 }
 ```

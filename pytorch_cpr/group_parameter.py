@@ -27,6 +27,8 @@ def group_parameters_for_cpr_optimizer(model, regularize_embedding=False):
                 no_decay.add(fpn)
             elif pn.endswith('bias'):
                 no_decay.add(fpn)
+            elif not regularize_embedding and "embed" in fpn:
+                no_decay.add(fpn)
             elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
                 decay.add(fpn)
             elif isinstance(m, blacklist_weight_modules):
