@@ -1,6 +1,6 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
-from typing import cast, List, Optional, Tuple, Union
+from typing import Literal, cast, List, Optional, Tuple, Union
 import functools
 
 import torch
@@ -98,9 +98,12 @@ class AdamCPR(Optimizer):
             lr: Union[float, Tensor] = 1e-4,
             betas: Tuple[float, float] = (0.9, 0.999),
             eps: float = 1e-8,
-            kappa_init_method: str = 'inflection_point',
+            kappa_init_method: Literal["uniform", "warm_start", "dependent", "inflection_point"] = "inflection_point",
             kappa_init_param: float = 1000,
-            reg_function: str = 'l2',
+            reg_function: Literal["l2", "l1", "std", "huber"] = "l2",
+            adacpr_method: Literal["disable", "cosine", "reduce"] = "disable",
+            adacpr_param: float = 1.0,
+            train_steps: Optional[int] = None,
             kappa_update: float = 1.0,
             reg_step_size: int = 200,
             reg_ema_decay: float = 0.99,
@@ -175,6 +178,14 @@ class AdamCPR(Optimizer):
             self.warm_start = 0
             self.kappa_init_param = kappa_init_param
 
+        self.adacpr_method = adacpr_method
+        self.adacpr_param = adacpr_param
+        if self.adacpr_method not in ["disable", "cosine", "reduce"]:
+            raise ValueError(f"Invalid adacpr_method: {adacpr_method}")
+        if self.adacpr_method == "cosine":
+            assert train_steps is not None, "train_steps must be set when using cosine adacpr_method"
+        self.train_steps = train_steps
+
         self.kappa_update = kappa_update
 
         defaults = dict(
@@ -229,6 +240,8 @@ class AdamCPR(Optimizer):
             max_exp_avg_sqs,
             lagmuls,
             kappas,
+            decay_steps,
+            min_kappas,
             kappa_updates,
             prev_regs,
             prev_reg_gradients,
@@ -306,11 +319,17 @@ class AdamCPR(Optimizer):
                     kappa = torch.tensor(0.0, dtype=torch.float, device=p.device)
                     single_initialize_kappa(kappa, p, self.reg_function)
                     state["kappa"] = self.kappa_init_param * kappa.detach()
+                    # is `-1` during warmup phase, and then contains the starting step of the decay phase after it starts
+                state["decay_step"] = torch.tensor([-1], dtype=torch.float, device=p.device)
+                # the minimum kappa to decay towards
+                state["min_kappa"] = state["kappa"].clone()
 
             exp_avgs.append(state["exp_avg"])
             exp_avg_sqs.append(state["exp_avg_sq"])
             lagmuls.append(state['lagmul'])
             kappas.append(state['kappa'])
+            decay_steps.append(state['decay_step'])
+            min_kappas.append(state['min_kappa'])
             kappa_updates.append(state['kappa_update'])
             prev_regs.append(state['prev_reg'])
             prev_reg_gradients.append(state['prev_reg_gradient'])
@@ -359,6 +378,8 @@ class AdamCPR(Optimizer):
             max_exp_avg_sqs: List[Tensor] = []
             lagmuls: List[Tensor] = []
             kappas: List[Tensor] = []
+            decay_steps: List[Tensor] = []
+            min_kappas: List[Tensor] = []
             kappa_updates: List[Tensor] = []
             prev_regs: List[Tensor] = []
             prev_reg_gradients: List[Tensor] = []
@@ -377,6 +398,8 @@ class AdamCPR(Optimizer):
                 max_exp_avg_sqs,
                 lagmuls,
                 kappas,
+                decay_steps,
+                min_kappas,
                 kappa_updates,
                 prev_regs,
                 prev_reg_gradients,
@@ -392,6 +415,8 @@ class AdamCPR(Optimizer):
                 max_exp_avg_sqs,
                 lagmuls,
                 kappas,
+                decay_steps,
+                min_kappas,
                 kappa_updates,
                 prev_regs,
                 prev_reg_gradients,
@@ -406,6 +431,9 @@ class AdamCPR(Optimizer):
                 reg_function=self.reg_function,
                 reg_by_lr=self.reg_by_lr,
                 kappa_init_method=self.kappa_init_method,
+                adacpr_method=self.adacpr_method,
+                adacpr_param=self.adacpr_param,
+                train_steps=self.train_steps,
                 reg_step_size=self.reg_step_size,
                 reg_ema_decay=self.reg_ema_decay,
                 eps=group['eps'],
@@ -483,6 +511,8 @@ def _single_tensor_adamcpr(
         max_exp_avg_sqs: List[Tensor],
         lagmuls: List[Tensor],
         kappas: List[Tensor],
+        decay_steps: List[Tensor],
+        min_kappas: List[Tensor],
         kappa_updates: List[Tensor],
         prev_regs: List[Tensor],
         prev_reg_gradients: List[Tensor],
@@ -500,6 +530,9 @@ def _single_tensor_adamcpr(
         reg_function: str,
         reg_by_lr: bool,
         kappa_init_method: str,
+        adacpr_method: str,
+        adacpr_param: float,
+        train_steps: Optional[int],
         reg_step_size: int,
         reg_ema_decay: float,
         eps: float,
@@ -522,6 +555,8 @@ def _single_tensor_adamcpr(
         exp_avg_sq = exp_avg_sqs[i]
         lagmul = lagmuls[i]
         kappa = kappas[i]
+        decay_step = decay_steps[i]
+        min_kappa = min_kappas[i]
         kappa_update = kappa_updates[i]
         prev_reg = prev_regs[i]
         prev_reg_gradient = prev_reg_gradients[i]
@@ -613,12 +648,31 @@ def _single_tensor_adamcpr(
                     # Peak detection for gradient
                     if step > reg_step_size * 3 and prev_reg_gradient > current_reg_gradient:
                         single_initialize_kappa(kappa, param, reg_function)
+                        if adacpr_method == "cosine":
+                            single_initialize_kappa(min_kappa, param, reg_function)
+                            min_kappa.mul_(adacpr_param)
+                            decay_step.copy_(step)
                     # Update previous values for next iteration
                     prev_reg.copy_(inflection_point_ema)
                     if step > reg_step_size * 2:
                         prev_reg_gradient.copy_(current_reg_gradient)
 
             elif step > warm_start:
+                # Adapt Kappa
+                if adacpr_method == "cosine":
+                    # cosine update
+                    cur_step = step - decay_step
+                    T_max = train_steps - decay_step
+                    factor = (1 + torch.cos(torch.pi * cur_step / T_max)) / (
+                        1 + torch.cos(torch.pi * (cur_step - 1) / T_max)
+                    )
+                    if factor.isnan():  # why does this happen?
+                        factor = 1
+                    kappa.sub_(min_kappa).mul_(factor).add_(min_kappa)
+                elif adacpr_method == "reduce":
+                    old_lagmul = lagmul.clone()
+
+                # Apply regularization
                 if reg_function == 'l2':
                     l2_update(param, lagmul, kappa, kappa_update, reg_by_lr, lr)
                 elif reg_function == 'std':
@@ -630,8 +684,19 @@ def _single_tensor_adamcpr(
                 else:
                     raise ValueError(f"Unsupported regularization function: {reg_function}")
 
+                # Adapt Kappa
+                if adacpr_method == "reduce" and old_lagmul > 0 and lagmul == 0:
+                    old_kappa = kappa.clone()
+                    single_initialize_kappa(kappa, param, reg_function)
+                    diff = old_kappa.sub(kappa)
+                    kappa.sub_(diff.mul(adacpr_param - 1))
+
             elif kappa_init_method == 'warm_start' and step == warm_start:
                 single_initialize_kappa(kappa, param, reg_function)
+                if adacpr_method == "cosine":
+                    single_initialize_kappa(min_kappa, param, reg_function)
+                    min_kappa.mul_(adacpr_param)
+                    decay_step.copy_(step)
 
         # Lastly, switch back to complex view
         if amsgrad and torch.is_complex(params[i]):
@@ -646,6 +711,8 @@ def _multi_tensor_adamcpr(
         max_exp_avg_sqs: List[Tensor],
         lagmuls: List[Tensor],
         kappas: List[Tensor],
+        decay_steps: List[Tensor],
+        min_kappas: List[Tensor],
         kappa_updates: List[Tensor],
         prev_regs: List[Tensor],
         prev_reg_gradients: List[Tensor],
@@ -663,6 +730,9 @@ def _multi_tensor_adamcpr(
         reg_function: str,
         reg_by_lr: bool,
         kappa_init_method: str,
+        adacpr_method: str,
+        adacpr_param: float,
+        train_steps: Optional[int],
         reg_step_size: int,
         reg_ema_decay: float,
         eps: float,
@@ -673,6 +743,9 @@ def _multi_tensor_adamcpr(
 ):
     if len(params) == 0:
         return
+    
+    if adacpr_method != "disable":
+        raise NotImplementedError("Adacpr is not yet supported for _foreach ops")
 
     if isinstance(lr, Tensor) and not capturable:
         raise RuntimeError(
@@ -988,6 +1061,8 @@ def adamcpr(
         max_exp_avg_sqs: List[Tensor],
         lagmuls: List[Tensor],
         kappas: List[Tensor],
+        decay_steps: List[Tensor],
+        min_kappas: List[Tensor],
         kappa_updates: List[Tensor],
         prev_regs: List[Tensor],
         prev_reg_gradients: List[Tensor],
@@ -1009,6 +1084,9 @@ def adamcpr(
         reg_function: str,
         reg_by_lr: bool,
         kappa_init_method: str,
+        adacpr_method: str,
+        adacpr_param: float,
+        train_steps: Optional[int],
         reg_step_size: int,
         reg_ema_decay: float,
         eps: float,
@@ -1052,6 +1130,8 @@ def adamcpr(
         max_exp_avg_sqs,
         lagmuls,
         kappas,
+        decay_steps,
+        min_kappas,
         kappa_updates,
         prev_regs,
         prev_reg_gradients,
@@ -1066,6 +1146,9 @@ def adamcpr(
         reg_function=reg_function,
         reg_by_lr=reg_by_lr,
         kappa_init_method=kappa_init_method,
+        adacpr_method=adacpr_method,
+        adacpr_param=adacpr_param,
+        train_steps=train_steps,
         reg_step_size=reg_step_size,
         reg_ema_decay=reg_ema_decay,
         eps=eps,
