@@ -74,7 +74,7 @@ def _disable_dynamo_if_unsupported(single_tensor_fn=None):
     return wrapper
 
 
-def single_initilize_kappa(kappa, param, reg_function):
+def single_initialize_kappa(kappa, param, reg_function):
     if reg_function == 'l2':
         kappa.mul_(0).add_(param.square().sum())
     elif reg_function == 'std':
@@ -304,7 +304,7 @@ class AdamCPR(Optimizer):
                     state["kappa"] = torch.tensor(HIGHKAPPA, dtype=torch.float, device=p.device)
                 elif self.kappa_init_method == 'dependent':
                     kappa = torch.tensor(0.0, dtype=torch.float, device=p.device)
-                    single_initilize_kappa(kappa, p, self.reg_function)
+                    single_initialize_kappa(kappa, p, self.reg_function)
                     state["kappa"] = self.kappa_init_param * kappa.detach()
 
             exp_avgs.append(state["exp_avg"])
@@ -605,14 +605,14 @@ def _single_tensor_adamcpr(
             param.addcdiv_(exp_avg, denom, value=-step_size)
 
         if regularize:
-            if kappa_init_method == 'inflection_point' and kappa == 1000:
+            if kappa_init_method == 'inflection_point' and kappa == HIGHKAPPA:
                 current_l2m = param.square().sum()
                 inflection_point_ema.mul_(reg_ema_decay).add_(current_l2m, alpha=1 - reg_ema_decay)
                 if step > reg_step_size * 1 and step % reg_step_size == 0:
                     current_reg_gradient = inflection_point_ema - prev_reg
                     # Peak detection for gradient
                     if step > reg_step_size * 3 and prev_reg_gradient > current_reg_gradient:
-                        single_initilize_kappa(kappa, param, reg_function)
+                        single_initialize_kappa(kappa, param, reg_function)
                     # Update previous values for next iteration
                     prev_reg.copy_(inflection_point_ema)
                     if step > reg_step_size * 2:
@@ -631,7 +631,7 @@ def _single_tensor_adamcpr(
                     raise ValueError(f"Unsupported regularization function: {reg_function}")
 
             elif kappa_init_method == 'warm_start' and step == warm_start:
-                single_initilize_kappa(kappa, param, reg_function)
+                single_initialize_kappa(kappa, param, reg_function)
 
         # Lastly, switch back to complex view
         if amsgrad and torch.is_complex(params[i]):
@@ -951,7 +951,7 @@ def _multi_tensor_adamcpr(
                         for i in range(len(device_params)):
                             if device_prev_reg_gradients[i] > current_gradients[i] > 0.01 \
                                     and device_kappas[i] == HIGHKAPPA:
-                                single_initilize_kappa(device_kappas[i], device_params[i], reg_function)
+                                single_initialize_kappa(device_kappas[i], device_params[i], reg_function)
 
                     if device_state_steps[0] > reg_step_size * 2:
                         torch._foreach_copy_(device_prev_reg_gradients, current_gradients)
