@@ -741,14 +741,6 @@ def _multi_tensor_adamcpr(
 ):
     if len(params) == 0:
         return
-    
-    
-    if adacpr_method != "disable":
-        raise NotImplementedError("Adacpr is not yet supported for _foreach ops")
-
-
-    if adacpr_method != "disable":
-        raise NotImplementedError("Adacpr is not yet supported for _foreach ops")
 
     if isinstance(lr, Tensor) and not capturable:
         raise RuntimeError(
