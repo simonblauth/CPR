@@ -1,22 +1,25 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
-from typing import Literal, cast, List, Optional, Tuple, Union
 import functools
+from math import ceil
+from typing import List, Literal, Optional, Tuple, Union, cast
 
 import torch
 from torch import Tensor
 from torch._utils import is_compiling
 from torch.optim.optimizer import (
+    Optimizer,
+    ParamsT,
     _default_to_fused_or_foreach,
     _get_scalar_dtype,
     _get_value,
     _stack_if_compiling,
     _use_grad_for_differentiable,
     _view_as_real,
-    Optimizer,
-    ParamsT,
 )
+
 from .group_parameter import group_parameters_for_cpr_optimizer
+
 
 ###
 # copy code snippets from PyTorch 2.5 to make AdamCPR compatible to PyTorch 2.3.1+
@@ -103,6 +106,7 @@ class AdamCPR(Optimizer):
             reg_function: Literal["l2", "l1", "std", "huber"] = "l2",
             adacpr_method: Literal["disable", "cosine", "reduce"] = "disable",
             adacpr_param: float = 1.0,
+            adacpr_start: int | float | None = None,
             train_steps: Optional[int] = None,
             kappa_update: float = 1.0,
             reg_step_size: int = 200,
@@ -136,6 +140,16 @@ class AdamCPR(Optimizer):
             kappa_init_param (float, optional): The value to initialize the upper bound of the regularization term (default: 1000).
             reg_function (str, optional): The regularization function to use (default: 'l2').
                 Options are 'l2', 'l1', 'std', 'huber'.
+            adacpr_method (str, optional): Method to adapt kappa during training (default: 'disable').
+                Options are 'disable', 'cosine', 'reduce'.
+            adacpr_param (float): Depends on the adacpr_method. (default: 1.0).
+                If adacpr_method is 'cosine', the minimum value of kappa to decay towards is given by initial_kappa * adacpr_param.
+                If adacpr_method is 'reduce', the reduction of kappa is scaled by adacpr_param.
+            adacpr_start (int, float, optional): The step at which to start the kappa adaptation (default: None).
+                If None, the kappa adaptation starts at the first step of regularization.
+                If between 0 and 1, the kappa adaptation starts at the corresponding fraction of total training steps.
+                If an integer, the kappa adaptation starts at the corresponding step.
+            train_steps (int, optional): The total number of training steps, only needed for adacpr_method='cosine' (default: None).
             kappa_update (float, optional): The update rate for the regularization term (default: 1.0).
             reg_step_size (int, optional): The sampling rate to detect the inflection point (default: 200).
             reg_ema_decay (float, optional): The decay rate for the exponential moving average of the inflection point (default: 0.9).
@@ -185,6 +199,11 @@ class AdamCPR(Optimizer):
         if self.adacpr_method == "cosine":
             assert train_steps is not None, "train_steps must be set when using cosine adacpr_method"
         self.train_steps = train_steps
+        if adacpr_start is not None and 0 < adacpr_start < 1:
+            assert self.train_steps is not None, "train_steps must be set when giving adacpr_start as a factor"
+            self.adacpr_start  = int(ceil(adacpr_start * self.train_steps))
+        else:
+            self.adacpr_start = adacpr_start
 
         self.kappa_update = kappa_update
 
@@ -319,8 +338,9 @@ class AdamCPR(Optimizer):
                     kappa = torch.tensor(0.0, dtype=torch.float, device=p.device)
                     single_initialize_kappa(kappa, p, self.reg_function)
                     state["kappa"] = self.kappa_init_param * kappa.detach()
-                    # is `-1` during warmup phase, and then contains the starting step of the decay phase after it starts
-                state["decay_step"] = torch.tensor(-1, dtype=torch.float, device=p.device)
+                # is `inf` during warmup phase, and then contains the starting step of the decay phase after it starts
+                adacpr_start = torch.inf if self.adacpr_start is None else self.adacpr_start
+                state["decay_step"] = torch.tensor(adacpr_start, dtype=torch.float, device=p.device)
                 # the minimum kappa to decay towards
                 state["min_kappa"] = state["kappa"].clone()
 
@@ -651,6 +671,7 @@ def _single_tensor_adamcpr(
                         if adacpr_method == "cosine":
                             single_initialize_kappa(min_kappa, param, reg_function)
                             min_kappa.mul_(adacpr_param)
+                        if decay_step.isinf():
                             decay_step.copy_(step).add_(1)
                     # Update previous values for next iteration
                     prev_reg.copy_(inflection_point_ema)
@@ -659,16 +680,17 @@ def _single_tensor_adamcpr(
 
             elif step > warm_start:
                 # Adapt Kappa
-                if adacpr_method == "cosine":
-                    # cosine update
-                    cur_step = step - decay_step
-                    T_max = train_steps - decay_step
-                    factor = (1 + torch.cos(torch.pi * cur_step / T_max)) / (
-                        1 + torch.cos(torch.pi * (cur_step - 1) / T_max)
-                    )
-                    kappa.sub_(min_kappa).mul_(factor).add_(min_kappa)
-                elif adacpr_method == "reduce":
-                    old_lagmul = lagmul.clone()
+                if step > decay_step:
+                    if adacpr_method == "cosine":
+                        # cosine update
+                        cur_step = step - decay_step
+                        T_max = train_steps - decay_step
+                        factor = (1 + torch.cos(torch.pi * cur_step / T_max)) / (
+                            1 + torch.cos(torch.pi * (cur_step - 1) / T_max)
+                        )
+                        kappa.sub_(min_kappa).mul_(factor).add_(min_kappa)
+                    elif adacpr_method == "reduce":
+                        old_lagmul = lagmul.clone()
 
                 # Apply regularization
                 if reg_function == 'l2':
@@ -683,7 +705,7 @@ def _single_tensor_adamcpr(
                     raise ValueError(f"Unsupported regularization function: {reg_function}")
 
                 # Adapt Kappa
-                if adacpr_method == "reduce" and old_lagmul > 0 and lagmul == 0:
+                if step > decay_step and adacpr_method == "reduce" and old_lagmul > 0 and lagmul == 0:
                     old_kappa = kappa.clone()
                     single_initialize_kappa(kappa, param, reg_function)
                     diff = old_kappa.sub(kappa)
@@ -694,6 +716,7 @@ def _single_tensor_adamcpr(
                 if adacpr_method == "cosine":
                     single_initialize_kappa(min_kappa, param, reg_function)
                     min_kappa.mul_(adacpr_param)
+                if decay_step.isinf():
                     decay_step.copy_(step).add_(1)
 
         # Lastly, switch back to complex view
@@ -931,41 +954,42 @@ def _multi_tensor_adamcpr(
 
         if regularize:
             if device_state_steps[0] > warm_start:
-                if adacpr_method == "reduce":
-                    device_prev_lagmuls = [t.clone() for t in device_lagmuls]
-                elif adacpr_method == "cosine":
-                    device_cur_steps = torch._foreach_sub(device_state_steps, decay_steps)
-                    device_tmax = torch._foreach_mul(device_decay_steps, -1)
-                    torch._foreach_add_(device_tmax, train_steps)  # type: ignore (train_steps cannot be None here)
-                    device_factors = torch._foreach_div(
-                        torch._foreach_add(
-                            torch._foreach_cos(
-                                torch._foreach_div(
-                                    torch._foreach_mul(device_cur_steps, torch.pi),
-                                    device_tmax,
+                if any(s > d for s, d in zip(device_state_steps, device_decay_steps)):
+                    if adacpr_method == "reduce":
+                        device_prev_lagmuls = [t.clone() for t in device_lagmuls]
+                    elif adacpr_method == "cosine":
+                        device_cur_steps = torch._foreach_sub(device_state_steps, decay_steps)
+                        device_tmax = torch._foreach_mul(device_decay_steps, -1)
+                        torch._foreach_add_(device_tmax, train_steps)  # type: ignore (train_steps cannot be None here)
+                        device_factors = torch._foreach_div(
+                            torch._foreach_add(
+                                torch._foreach_cos(
+                                    torch._foreach_div(
+                                        torch._foreach_mul(device_cur_steps, torch.pi),
+                                        device_tmax,
+                                    ),
                                 ),
+                                1,
                             ),
-                            1,
-                        ),
-                        torch._foreach_add(
-                            torch._foreach_cos(
-                                torch._foreach_div(
-                                    torch._foreach_mul(
-                                        torch._foreach_sub(device_cur_steps, 1),
-                                        torch.pi),
-                                    device_tmax,
+                            torch._foreach_add(
+                                torch._foreach_cos(
+                                    torch._foreach_div(
+                                        torch._foreach_mul(
+                                            torch._foreach_sub(device_cur_steps, 1),
+                                            torch.pi),
+                                        device_tmax,
+                                    ),
                                 ),
+                                1,
                             ),
-                            1,
-                        ),
-                    )
-                    # only decay after warm_start
-                    for i in range(len(device_decay_steps)):
-                        if device_decay_steps[i] < 0:
-                            device_factors[i].fill_(1.0)
-                    torch._foreach_sub_(device_kappas, device_min_kappas)
-                    torch._foreach_mul_(device_kappas, device_factors)
-                    torch._foreach_add_(device_kappas, device_min_kappas)
+                        )
+                        # only decay after warm_start
+                        for i in range(len(device_decay_steps)):
+                            if device_state_steps[i] < device_decay_steps[i]:
+                                device_factors[i].fill_(1.0)
+                        torch._foreach_sub_(device_kappas, device_min_kappas)
+                        torch._foreach_mul_(device_kappas, device_factors)
+                        torch._foreach_add_(device_kappas, device_min_kappas)
 
                 if reg_function == 'l2':
                     square_sum_params = torch._foreach_pow(torch._foreach_norm(device_params), 2)
@@ -1038,12 +1062,13 @@ def _multi_tensor_adamcpr(
                 else:
                     raise ValueError(f"Unsupported regularization function: {reg_function}")
                 
-                if adacpr_method == "reduce":
-                    for i in range(len(device_params)):
-                        if device_prev_lagmuls[i] > 0 and device_lagmuls[i] == 0:
-                            old_kappa = device_kappas[i].clone()
-                            single_initialize_kappa(device_kappas[i], device_params[i], reg_function)
-                            device_kappas[i].sub_(old_kappa.sub(device_kappas[i]).mul(adacpr_param - 1))
+                if any(s > d for s, d in zip(device_state_steps, device_decay_steps)):
+                    if adacpr_method == "reduce":
+                        for i in range(len(device_params)):
+                            if device_prev_lagmuls[i] > 0 and device_lagmuls[i] == 0:
+                                old_kappa = device_kappas[i].clone()
+                                single_initialize_kappa(device_kappas[i], device_params[i], reg_function)
+                                device_kappas[i].sub_(old_kappa.sub(device_kappas[i]).mul(adacpr_param - 1))
 
 
             if (kappa_init_method == 'inflection_point'
@@ -1073,6 +1098,7 @@ def _multi_tensor_adamcpr(
                                 if adacpr_method == "cosine":
                                     single_initialize_kappa(device_min_kappas[i], device_params[i], reg_function)
                                     device_min_kappas[i].mul_(adacpr_param)
+                                if decay_steps[i].isinf():
                                     decay_steps[i].copy_(device_state_steps[0]).add_(1)
 
                     if device_state_steps[0] > reg_step_size * 2:
@@ -1099,13 +1125,14 @@ def _multi_tensor_adamcpr(
                     new_kappas = [torch.where(param_abs < 1, 0.5 * square_param, param_abs - 0.5).sum() for
                                   param_abs, square_param in zip(abs_params, square_params)]
                     torch._foreach_add_(device_kappas, new_kappas)
-                
+
                 if adacpr_method == "cosine":
-                    torch._foreach_mul_(device_decay_steps, 0)
-                    torch._foreach_add_(device_decay_steps, device_state_steps)
-                    torch._foreach_add_(device_decay_steps, 1)
                     torch._foreach_copy_(device_min_kappas, device_kappas)
                     torch._foreach_mul_(device_min_kappas, adacpr_param)
+
+                for i in range(len(device_decay_steps)):
+                    if device_decay_steps[i].isinf():
+                        decay_steps[i].copy_(device_state_steps[0]).add_(1)
 
 
 @_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_adamcpr)
