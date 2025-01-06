@@ -672,7 +672,7 @@ def _single_tensor_adamcpr(
                             single_initialize_kappa(min_kappa, param, reg_function)
                             min_kappa.mul_(adacpr_param)
                         if decay_step.isinf():
-                            decay_step.copy_(step).add_(1)
+                            decay_step.copy_(step)
                     # Update previous values for next iteration
                     prev_reg.copy_(inflection_point_ema)
                     if step > reg_step_size * 2:
@@ -688,7 +688,8 @@ def _single_tensor_adamcpr(
                         factor = (1 + torch.cos(torch.pi * cur_step / T_max)) / (
                             1 + torch.cos(torch.pi * (cur_step - 1) / T_max)
                         )
-                        kappa.sub_(min_kappa).mul_(factor).add_(min_kappa)
+                        if factor.isfinite():
+                            kappa.sub_(min_kappa).mul_(factor).add_(min_kappa)
                     elif adacpr_method == "reduce":
                         old_lagmul = lagmul.clone()
 
@@ -717,7 +718,7 @@ def _single_tensor_adamcpr(
                     single_initialize_kappa(min_kappa, param, reg_function)
                     min_kappa.mul_(adacpr_param)
                 if decay_step.isinf():
-                    decay_step.copy_(step).add_(1)
+                    decay_step.copy_(step)
 
         # Lastly, switch back to complex view
         if amsgrad and torch.is_complex(params[i]):
@@ -985,7 +986,7 @@ def _multi_tensor_adamcpr(
                         )
                         # only decay after warm_start
                         for i in range(len(device_decay_steps)):
-                            if device_state_steps[i] < device_decay_steps[i]:
+                            if device_state_steps[i] < device_decay_steps[i] or not device_factors[i].isfinite():
                                 device_factors[i].fill_(1.0)
                         torch._foreach_sub_(device_kappas, device_min_kappas)
                         torch._foreach_mul_(device_kappas, device_factors)
@@ -1099,7 +1100,7 @@ def _multi_tensor_adamcpr(
                                     single_initialize_kappa(device_min_kappas[i], device_params[i], reg_function)
                                     device_min_kappas[i].mul_(adacpr_param)
                                 if decay_steps[i].isinf():
-                                    decay_steps[i].copy_(device_state_steps[0]).add_(1)
+                                    decay_steps[i].copy_(device_state_steps[0])
 
                     if device_state_steps[0] > reg_step_size * 2:
                         torch._foreach_copy_(device_prev_reg_gradients, current_gradients)
@@ -1132,7 +1133,7 @@ def _multi_tensor_adamcpr(
 
                 for i in range(len(device_decay_steps)):
                     if device_decay_steps[i].isinf():
-                        decay_steps[i].copy_(device_state_steps[0]).add_(1)
+                        decay_steps[i].copy_(device_state_steps[0])
 
 
 @_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_adamcpr)
