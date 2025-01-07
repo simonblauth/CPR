@@ -104,11 +104,12 @@ class AdamCPR(Optimizer):
             kappa_init_method: Literal["uniform", "warm_start", "dependent", "inflection_point"] = "inflection_point",
             kappa_init_param: float = 1000,
             reg_function: Literal["l2", "l1", "std", "huber"] = "l2",
-            adacpr_method: Literal["disable", "cosine", "reduce"] = "disable",
+            adacpr_method: Literal["disable", "cosine", "reduce", "reduce_factor"] = "disable",
             adacpr_param: float = 1.0,
             adacpr_start: int | float | None = None,
             adacpr_smoothing: float = 0.0,
             adacpr_eps: float = 0.0,
+            adacpr_reduce_while_inactive: bool = False,
             train_steps: Optional[int] = None,
             kappa_update: float = 1.0,
             reg_step_size: int = 200,
@@ -153,6 +154,7 @@ class AdamCPR(Optimizer):
                 If an integer, the kappa adaptation starts at the corresponding step.
             adacpr_smoothing (float, optional): The smoothing factor of the exponential moving average of the lagrange multipliers, only needed for adacpr_method='reduce' (default: 0.0).
             adacpr_eps (float): The epsilon value below which the constraints are considered inactive, only needed for adacpr_method='reduce' (default: 0.0).
+            adacpr_reduce_while_inactive (bool, optional): Whether to reduce kappa while the constraints are inactive or only when becoming inactive, only needed for adacpr_method='reduce' (default: False).
             train_steps (int, optional): The total number of training steps, only needed for adacpr_method='cosine' (default: None).
             kappa_update (float, optional): The update rate for the regularization term (default: 1.0).
             reg_step_size (int, optional): The sampling rate to detect the inflection point (default: 200).
@@ -199,8 +201,9 @@ class AdamCPR(Optimizer):
         self.adacpr_method = adacpr_method
         self.adacpr_param = adacpr_param
         self.adacpr_smoothing = adacpr_smoothing
+        self.adacpr_reduce_while_inactive = adacpr_reduce_while_inactive
         self.adacpr_eps = adacpr_eps
-        if self.adacpr_method not in ["disable", "cosine", "reduce"]:
+        if self.adacpr_method not in ["disable", "cosine", "reduce", "reduce_factor"]:
             raise ValueError(f"Invalid adacpr_method: {adacpr_method}")
         if self.adacpr_method == "cosine":
             assert train_steps is not None, "train_steps must be set when using cosine adacpr_method"
@@ -467,6 +470,7 @@ class AdamCPR(Optimizer):
                 adacpr_param=self.adacpr_param,
                 adacpr_smoothing=self.adacpr_smoothing,
                 adacpr_eps=self.adacpr_eps,
+                adacpr_reduce_while_inactive=self.adacpr_reduce_while_inactive,
                 train_steps=self.train_steps,
                 reg_step_size=self.reg_step_size,
                 reg_ema_decay=self.reg_ema_decay,
@@ -569,6 +573,7 @@ def _single_tensor_adamcpr(
         adacpr_param: float,
         adacpr_smoothing: float,
         adacpr_eps: float,
+        adacpr_reduce_while_inactive: bool,
         train_steps: Optional[int],
         reg_step_size: int,
         reg_ema_decay: float,
@@ -721,13 +726,16 @@ def _single_tensor_adamcpr(
                         )
                         if factor.isfinite():
                             kappa.sub_(min_kappa).mul_(factor).add_(min_kappa)
-                    elif adacpr_method == "reduce":
+                    elif adacpr_method == "reduce" or adacpr_method == "reduce_factor":
                         new_lagmul_ema = lagmul_ema.mul(adacpr_smoothing).add(lagmul, alpha=1 - adacpr_smoothing)
-                        if new_lagmul_ema <= adacpr_eps and lagmul_ema > adacpr_eps:
-                            old_kappa = kappa.clone()
-                            single_initialize_kappa(kappa, param, reg_function)
-                            diff = old_kappa.sub(kappa)
-                            kappa.sub_(diff.mul(adacpr_param - 1))
+                        if new_lagmul_ema <= adacpr_eps and (lagmul_ema > adacpr_eps or adacpr_reduce_while_inactive):
+                            if adacpr_method == "reduce_factor":
+                                kappa.mul_(adacpr_param)
+                            else:
+                                old_kappa = kappa.clone()
+                                single_initialize_kappa(kappa, param, reg_function)
+                                diff = old_kappa.sub(kappa)
+                                kappa.sub_(diff.mul(adacpr_param - 1))
                         lagmul_ema.copy_(new_lagmul_ema)
 
             elif kappa_init_method == 'warm_start' and step == warm_start:
@@ -775,6 +783,7 @@ def _multi_tensor_adamcpr(
         adacpr_param: float,
         adacpr_smoothing: float,
         adacpr_eps: float,
+        adacpr_reduce_while_inactive: bool,
         train_steps: Optional[int],
         reg_step_size: int,
         reg_ema_decay: float,
@@ -1054,16 +1063,19 @@ def _multi_tensor_adamcpr(
 
                 # Adapt Kappa
                 if any(s > d for s, d in zip(device_state_steps, device_adacpr_start_steps)):
-                    if adacpr_method == "reduce":
+                    if adacpr_method == "reduce" or adacpr_method == "reduce_factor":
                         device_next_lagmul_emas = torch._foreach_mul(
                             device_lagmul_emas, adacpr_smoothing
                         )
                         torch._foreach_add_(device_next_lagmul_emas, device_lagmuls, alpha=1 - adacpr_smoothing)
                         for i in range(len(device_lagmul_emas)):
-                            if device_state_steps[i] > device_adacpr_start_steps[i] and device_next_lagmul_emas[i] <= adacpr_eps and device_lagmul_emas[i] > adacpr_eps:
-                                old_kappa = device_kappas[i].clone()
-                                single_initialize_kappa(device_kappas[i], device_params[i], reg_function)
-                                device_kappas[i].sub_(old_kappa.sub(device_kappas[i]).mul(adacpr_param - 1))
+                            if device_state_steps[i] > device_adacpr_start_steps[i] and device_next_lagmul_emas[i] <= adacpr_eps and (device_lagmul_emas[i] > adacpr_eps or adacpr_reduce_while_inactive):
+                                if adacpr_method == "reduce_factor":
+                                    device_kappas[i].mul_(adacpr_param)
+                                else:
+                                    old_kappa = device_kappas[i].clone()
+                                    single_initialize_kappa(device_kappas[i], device_params[i], reg_function)
+                                    device_kappas[i].sub_(old_kappa.sub(device_kappas[i]).mul(adacpr_param - 1))
                         torch._foreach_copy_(device_lagmul_emas, device_next_lagmul_emas)
                     elif adacpr_method == "cosine":
                         device_cur_steps = torch._foreach_sub(device_state_steps, device_adacpr_start_steps)
@@ -1200,6 +1212,7 @@ def adamcpr(
         adacpr_param: float,
         adacpr_smoothing: float,
         adacpr_eps: float,
+        adacpr_reduce_while_inactive: bool,
         train_steps: Optional[int],
         reg_step_size: int,
         reg_ema_decay: float,
@@ -1265,6 +1278,7 @@ def adamcpr(
         adacpr_param=adacpr_param,
         adacpr_smoothing=adacpr_smoothing,
         adacpr_eps=adacpr_eps,
+        adacpr_reduce_while_inactive=adacpr_reduce_while_inactive,
         train_steps=train_steps,
         reg_step_size=reg_step_size,
         reg_ema_decay=reg_ema_decay,
