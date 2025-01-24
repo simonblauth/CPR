@@ -211,6 +211,8 @@ class AdamCPR(Optimizer):
         if adacpr_start is not None and 0 < adacpr_start < 1:
             assert self.train_steps is not None, "train_steps must be set when giving adacpr_start as a factor"
             self.adacpr_start  = int(ceil(adacpr_start * self.train_steps))
+        elif adacpr_start is None and self.kappa_init_method not in ["inflection_point", "warm_start"]:
+            self.adacpr_start = 0
         else:
             self.adacpr_start = adacpr_start
 
@@ -354,6 +356,8 @@ class AdamCPR(Optimizer):
                 state["adacpr_start_step"] = torch.tensor(adacpr_start, dtype=torch.float, device=p.device)
                 # the minimum kappa to decay towards
                 state["min_kappa"] = state["kappa"].clone()
+                if self.kappa_init_method in ["uniform", "dependent"]:
+                    state["min_kappa"].mul_(self.adacpr_param)
 
             exp_avgs.append(state["exp_avg"])
             exp_avg_sqs.append(state["exp_avg_sq"])
