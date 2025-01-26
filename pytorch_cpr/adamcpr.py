@@ -104,7 +104,7 @@ class AdamCPR(Optimizer):
             kappa_init_method: Literal["uniform", "warm_start", "dependent", "inflection_point"] = "inflection_point",
             kappa_init_param: float = 1000,
             reg_function: Literal["l2", "l1", "std", "huber"] = "l2",
-            adacpr_method: Literal["disable", "cosine", "reduce", "reduce_factor"] = "disable",
+            adacpr_method: Literal["disable", "cosine", "cosine_to_init", "reduce", "reduce_factor"] = "disable",
             adacpr_param: float = 1.0,
             adacpr_start: int | float | None = None,
             adacpr_smoothing: float = 0.0,
@@ -144,9 +144,10 @@ class AdamCPR(Optimizer):
             reg_function (str, optional): The regularization function to use (default: 'l2').
                 Options are 'l2', 'l1', 'std', 'huber'.
             adacpr_method (str, optional): Method to adapt kappa during training (default: 'disable').
-                Options are 'disable', 'cosine', 'reduce'.
+                Options are 'disable', 'cosine', 'cosine_to_init', 'reduce', 'reduce_factor'.
             adacpr_param (float): Depends on the adacpr_method. (default: 1.0).
-                If adacpr_method is 'cosine', the minimum value of kappa to decay towards is given by initial_kappa * adacpr_param.
+                If adacpr_method is 'cosine', the minimum value of kappa to decay towards is given by (kappa after init) * adacpr_param.
+                If adacpr_method is 'cosine_to_init', the minimum value of kappa to decay towards is given by (reg_fn(param) before training starts) * adacpr_param.
                 If adacpr_method is 'reduce', the reduction of kappa is scaled by adacpr_param.
             adacpr_start (int, float, optional): The step at which to start the kappa adaptation (default: None).
                 If None, the kappa adaptation starts at the first step of regularization.
@@ -203,9 +204,9 @@ class AdamCPR(Optimizer):
         self.adacpr_smoothing = adacpr_smoothing
         self.adacpr_reduce_while_inactive = adacpr_reduce_while_inactive
         self.adacpr_eps = adacpr_eps
-        if self.adacpr_method not in ["disable", "cosine", "reduce", "reduce_factor"]:
+        if self.adacpr_method not in ["disable", "cosine", "cosine_to_init", "reduce", "reduce_factor"]:
             raise ValueError(f"Invalid adacpr_method: {adacpr_method}")
-        if self.adacpr_method == "cosine":
+        if self.adacpr_method in ["cosine", "cosine_to_init"]:
             assert train_steps is not None, "train_steps must be set when using cosine adacpr_method"
         self.train_steps = train_steps
         if adacpr_start is not None and 0 < adacpr_start < 1:
@@ -350,13 +351,15 @@ class AdamCPR(Optimizer):
                 elif self.kappa_init_method == 'dependent':
                     kappa = torch.tensor(0.0, dtype=torch.float, device=p.device)
                     single_initialize_kappa(kappa, p, self.reg_function)
-                    state["kappa"] = self.kappa_init_param * kappa.detach()
+                    state["kappa"] = kappa.mul(self.kappa_init_param)
                 # is `inf` during warmup phase, and then contains the starting step of the decay phase after it starts
                 adacpr_start = torch.inf if self.adacpr_start is None else self.adacpr_start
                 state["adacpr_start_step"] = torch.tensor(adacpr_start, dtype=torch.float, device=p.device)
                 # the minimum kappa to decay towards
                 state["min_kappa"] = state["kappa"].clone()
-                if self.kappa_init_method in ["uniform", "dependent"]:
+                if self.adacpr_method == "cosine_to_init":
+                    single_initialize_kappa(state["min_kappa"], p, self.reg_function)
+                if self.kappa_init_method in ["uniform", "dependent"] or self.adacpr_method == "cosine_to_init":
                     state["min_kappa"].mul_(self.adacpr_param)
 
             exp_avgs.append(state["exp_avg"])
@@ -721,7 +724,7 @@ def _single_tensor_adamcpr(
 
                 # Adapt Kappa
                 if step > adacpr_start_step:
-                    if adacpr_method == "cosine":
+                    if adacpr_method == "cosine" or adacpr_method == "cosine_to_init":
                         # cosine update
                         cur_step = step - adacpr_start_step
                         T_max = train_steps - adacpr_start_step
@@ -1081,7 +1084,7 @@ def _multi_tensor_adamcpr(
                                     single_initialize_kappa(device_kappas[i], device_params[i], reg_function)
                                     device_kappas[i].sub_(old_kappa.sub(device_kappas[i]).mul(adacpr_param - 1))
                         torch._foreach_copy_(device_lagmul_emas, device_next_lagmul_emas)
-                    elif adacpr_method == "cosine":
+                    elif adacpr_method == "cosine" or adacpr_method == "cosine_to_init":
                         device_cur_steps = torch._foreach_sub(device_state_steps, device_adacpr_start_steps)
                         device_tmax = torch._foreach_mul(device_adacpr_start_steps, -1)
                         torch._foreach_add_(device_tmax, train_steps)  # type: ignore (train_steps cannot be None here)
