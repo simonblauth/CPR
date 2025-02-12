@@ -1,22 +1,25 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
-from typing import cast, List, Optional, Tuple, Union
 import functools
+from math import ceil
+from typing import List, Literal, Optional, Tuple, Union, cast
 
 import torch
 from torch import Tensor
 from torch._utils import is_compiling
 from torch.optim.optimizer import (
+    Optimizer,
+    ParamsT,
     _default_to_fused_or_foreach,
     _get_scalar_dtype,
     _get_value,
     _stack_if_compiling,
     _use_grad_for_differentiable,
     _view_as_real,
-    Optimizer,
-    ParamsT,
 )
+
 from .group_parameter import group_parameters_for_cpr_optimizer
+
 
 ###
 # copy code snippets from PyTorch 2.5 to make AdamCPR compatible to PyTorch 2.3.1+
@@ -98,9 +101,16 @@ class AdamCPR(Optimizer):
             lr: Union[float, Tensor] = 1e-4,
             betas: Tuple[float, float] = (0.9, 0.999),
             eps: float = 1e-8,
-            kappa_init_method: str = 'inflection_point',
+            kappa_init_method: Literal["uniform", "warm_start", "dependent", "inflection_point"] = "inflection_point",
             kappa_init_param: float = 1000,
-            reg_function: str = 'l2',
+            reg_function: Literal["l2", "l1", "std", "huber"] = "l2",
+            adabound_method: Literal["disable", "cosine", "cosine_init", "reduce", "reduce_factor"] = "disable",
+            adabound_param: float = 1.0,
+            adabound_start: int | float | None = None,
+            adabound_smoothing: float = 0.0,
+            adabound_eps: float = 0.0,
+            adabound_reduce_while_inactive: bool = False,
+            train_steps: Optional[int] = None,
             kappa_update: float = 1.0,
             reg_step_size: int = 200,
             reg_ema_decay: float = 0.99,
@@ -133,6 +143,20 @@ class AdamCPR(Optimizer):
             kappa_init_param (float, optional): The value to initialize the upper bound of the regularization term (default: 1000).
             reg_function (str, optional): The regularization function to use (default: 'l2').
                 Options are 'l2', 'l1', 'std', 'huber'.
+            adabound_method (str, optional): Method to adapt kappa during training (default: 'disable').
+                Options are 'disable', 'cosine', 'cosine_init', 'reduce', 'reduce_factor'.
+            adabound_param (float): Hyperparameter for AdaBound. Corresponds to $\\alpha_d$ from paper. Effect depends on the adabound_method. (default: 1.0).
+                If adabound_method is 'cosine', the minimum value of kappa to decay towards is given by (kappa after init) * adabound_param.
+                If adabound_method is 'cosine_init', the minimum value of kappa to decay towards is given by (reg_fn(param) before training starts) * adabound_param.
+                If adabound_method is 'reduce', the reduction of kappa is scaled by adabound_param.
+            adabound_start (int, float, optional): The step at which to start the kappa adaptation (default: None).
+                If None, the kappa adaptation starts at the first step of regularization.
+                If between 0 and 1, the kappa adaptation starts at the corresponding fraction of total training steps.
+                If an integer, the kappa adaptation starts at the corresponding step.
+            adabound_smoothing (float, optional): The smoothing factor of the exponential moving average of the lagrange multipliers. Only needed for adabound_methods 'reduce' or 'reduce_factor' (default: 0.0).
+            adabound_eps (float): The epsilon value below which the constraints are considered inactive. Only needed for adabound_methods 'reduce' or 'reduce_factor' (default: 0.0).
+            adabound_reduce_while_inactive (bool, optional): Whether to reduce kappa while the constraints are inactive or only when becoming inactive. Only needed for adabound_methods 'reduce' or 'reduce_factor' (default: False).
+            train_steps (int, optional): The total number of training steps. Only required for adabound_methods 'cosine' or 'cosine_init' (default: None).
             kappa_update (float, optional): The update rate for the regularization term (default: 1.0).
             reg_step_size (int, optional): The sampling rate to detect the inflection point (default: 200).
             reg_ema_decay (float, optional): The decay rate for the exponential moving average of the inflection point (default: 0.9).
@@ -174,6 +198,24 @@ class AdamCPR(Optimizer):
         else:
             self.warm_start = 0
             self.kappa_init_param = kappa_init_param
+
+        self.adabound_method = adabound_method
+        self.adabound_param = adabound_param
+        self.adabound_smoothing = adabound_smoothing
+        self.adabound_reduce_while_inactive = adabound_reduce_while_inactive
+        self.adabound_eps = adabound_eps
+        if self.adabound_method not in ["disable", "cosine", "cosine_init", "reduce", "reduce_factor"]:
+            raise ValueError(f"Invalid adabound_method: {adabound_method}")
+        if self.adabound_method in ["cosine", "cosine_init"]:
+            assert train_steps is not None, "train_steps must be set when using cosine adabound_method"
+        self.train_steps = train_steps
+        if adabound_start is not None and 0 < adabound_start < 1:
+            assert self.train_steps is not None, "train_steps must be set when giving adabound_start as a factor"
+            self.adabound_start  = int(ceil(adabound_start * self.train_steps))
+        elif adabound_start is None and self.kappa_init_method not in ["inflection_point", "warm_start"]:
+            self.adabound_start = 0
+        else:
+            self.adabound_start = adabound_start
 
         self.kappa_update = kappa_update
 
@@ -228,7 +270,10 @@ class AdamCPR(Optimizer):
             exp_avg_sqs,
             max_exp_avg_sqs,
             lagmuls,
+            lagmul_emas,
             kappas,
+            adabound_start_steps,
+            min_kappas,
             kappa_updates,
             prev_regs,
             prev_reg_gradients,
@@ -284,6 +329,7 @@ class AdamCPR(Optimizer):
                     )
 
                 state['lagmul'] = torch.tensor([0.0], dtype=torch.float, device=p.device)
+                state['lagmul_ema'] = torch.tensor([0.0], dtype=torch.float, device=p.device)
                 state['prev_reg'] = torch.tensor([0.0], dtype=torch.float, device=p.device)
                 state['prev_reg_gradient'] = torch.tensor([0.0], dtype=torch.float, device=p.device)
                 state['inflection_point_emas'] = torch.tensor([0.0], dtype=torch.float, device=p.device)
@@ -305,12 +351,24 @@ class AdamCPR(Optimizer):
                 elif self.kappa_init_method == 'dependent':
                     kappa = torch.tensor(0.0, dtype=torch.float, device=p.device)
                     single_initialize_kappa(kappa, p, self.reg_function)
-                    state["kappa"] = self.kappa_init_param * kappa.detach()
+                    state["kappa"] = kappa.mul(self.kappa_init_param)
+                # is `inf` during warmup phase, and then contains the starting step of the decay phase after it starts
+                adabound_start = torch.inf if self.adabound_start is None else self.adabound_start
+                state["adabound_start_step"] = torch.tensor(adabound_start, dtype=torch.float, device=p.device)
+                # the minimum kappa to decay towards
+                state["min_kappa"] = state["kappa"].clone()
+                if self.adabound_method == "cosine_init":
+                    single_initialize_kappa(state["min_kappa"], p, self.reg_function)
+                if self.kappa_init_method in ["uniform", "dependent"] or self.adabound_method == "cosine_init":
+                    state["min_kappa"].mul_(self.adabound_param)
 
             exp_avgs.append(state["exp_avg"])
             exp_avg_sqs.append(state["exp_avg_sq"])
             lagmuls.append(state['lagmul'])
+            lagmul_emas.append(state['lagmul_ema'])
             kappas.append(state['kappa'])
+            adabound_start_steps.append(state['adabound_start_step'])
+            min_kappas.append(state['min_kappa'])
             kappa_updates.append(state['kappa_update'])
             prev_regs.append(state['prev_reg'])
             prev_reg_gradients.append(state['prev_reg_gradient'])
@@ -358,7 +416,10 @@ class AdamCPR(Optimizer):
             exp_avg_sqs: List[Tensor] = []
             max_exp_avg_sqs: List[Tensor] = []
             lagmuls: List[Tensor] = []
+            lagmul_emas: List[Tensor] = []
             kappas: List[Tensor] = []
+            adabound_start_steps: List[Tensor] = []
+            min_kappas: List[Tensor] = []
             kappa_updates: List[Tensor] = []
             prev_regs: List[Tensor] = []
             prev_reg_gradients: List[Tensor] = []
@@ -376,7 +437,10 @@ class AdamCPR(Optimizer):
                 exp_avg_sqs,
                 max_exp_avg_sqs,
                 lagmuls,
+                lagmul_emas,
                 kappas,
+                adabound_start_steps,
+                min_kappas,
                 kappa_updates,
                 prev_regs,
                 prev_reg_gradients,
@@ -391,7 +455,10 @@ class AdamCPR(Optimizer):
                 exp_avg_sqs,
                 max_exp_avg_sqs,
                 lagmuls,
+                lagmul_emas,
                 kappas,
+                adabound_start_steps,
+                min_kappas,
                 kappa_updates,
                 prev_regs,
                 prev_reg_gradients,
@@ -406,6 +473,12 @@ class AdamCPR(Optimizer):
                 reg_function=self.reg_function,
                 reg_by_lr=self.reg_by_lr,
                 kappa_init_method=self.kappa_init_method,
+                adabound_method=self.adabound_method,
+                adabound_param=self.adabound_param,
+                adabound_smoothing=self.adabound_smoothing,
+                adabound_eps=self.adabound_eps,
+                adabound_reduce_while_inactive=self.adabound_reduce_while_inactive,
+                train_steps=self.train_steps,
                 reg_step_size=self.reg_step_size,
                 reg_ema_decay=self.reg_ema_decay,
                 eps=group['eps'],
@@ -482,7 +555,10 @@ def _single_tensor_adamcpr(
         exp_avg_sqs: List[Tensor],
         max_exp_avg_sqs: List[Tensor],
         lagmuls: List[Tensor],
+        lagmul_emas: List[Tensor],
         kappas: List[Tensor],
+        adabound_start_steps: List[Tensor],
+        min_kappas: List[Tensor],
         kappa_updates: List[Tensor],
         prev_regs: List[Tensor],
         prev_reg_gradients: List[Tensor],
@@ -500,6 +576,12 @@ def _single_tensor_adamcpr(
         reg_function: str,
         reg_by_lr: bool,
         kappa_init_method: str,
+        adabound_method: str,
+        adabound_param: float,
+        adabound_smoothing: float,
+        adabound_eps: float,
+        adabound_reduce_while_inactive: bool,
+        train_steps: Optional[int],
         reg_step_size: int,
         reg_ema_decay: float,
         eps: float,
@@ -521,7 +603,10 @@ def _single_tensor_adamcpr(
         exp_avg = exp_avgs[i]
         exp_avg_sq = exp_avg_sqs[i]
         lagmul = lagmuls[i]
+        lagmul_ema = lagmul_emas[i]
         kappa = kappas[i]
+        adabound_start_step = adabound_start_steps[i]
+        min_kappa = min_kappas[i]
         kappa_update = kappa_updates[i]
         prev_reg = prev_regs[i]
         prev_reg_gradient = prev_reg_gradients[i]
@@ -613,12 +698,19 @@ def _single_tensor_adamcpr(
                     # Peak detection for gradient
                     if step > reg_step_size * 3 and prev_reg_gradient > current_reg_gradient:
                         single_initialize_kappa(kappa, param, reg_function)
+                        if adabound_method == "cosine":
+                            single_initialize_kappa(min_kappa, param, reg_function)
+                            min_kappa.mul_(adabound_param)
+                        if adabound_start_step.isinf():
+                            adabound_start_step.copy_(step)
                     # Update previous values for next iteration
                     prev_reg.copy_(inflection_point_ema)
                     if step > reg_step_size * 2:
                         prev_reg_gradient.copy_(current_reg_gradient)
 
             elif step > warm_start:
+
+                # Apply regularization
                 if reg_function == 'l2':
                     l2_update(param, lagmul, kappa, kappa_update, reg_by_lr, lr)
                 elif reg_function == 'std':
@@ -630,8 +722,36 @@ def _single_tensor_adamcpr(
                 else:
                     raise ValueError(f"Unsupported regularization function: {reg_function}")
 
+                # Adapt Kappa
+                if step > adabound_start_step:
+                    if adabound_method == "cosine" or adabound_method == "cosine_init":
+                        # cosine update
+                        cur_step = step - adabound_start_step
+                        T_max = train_steps - adabound_start_step
+                        factor = (1 + torch.cos(torch.pi * cur_step / T_max)) / (
+                            1 + torch.cos(torch.pi * (cur_step - 1) / T_max)
+                        )
+                        if factor.isfinite():
+                            kappa.sub_(min_kappa).mul_(factor).add_(min_kappa)
+                    elif adabound_method == "reduce" or adabound_method == "reduce_factor":
+                        new_lagmul_ema = lagmul_ema.mul(adabound_smoothing).add(lagmul, alpha=1 - adabound_smoothing)
+                        if new_lagmul_ema <= adabound_eps and (lagmul_ema > adabound_eps or adabound_reduce_while_inactive):
+                            if adabound_method == "reduce_factor":
+                                kappa.mul_(adabound_param)
+                            else:
+                                old_kappa = kappa.clone()
+                                single_initialize_kappa(kappa, param, reg_function)
+                                diff = old_kappa.sub(kappa)
+                                kappa.sub_(diff.mul(adabound_param - 1))
+                        lagmul_ema.copy_(new_lagmul_ema)
+
             elif kappa_init_method == 'warm_start' and step == warm_start:
                 single_initialize_kappa(kappa, param, reg_function)
+                if adabound_method == "cosine":
+                    single_initialize_kappa(min_kappa, param, reg_function)
+                    min_kappa.mul_(adabound_param)
+                if adabound_start_step.isinf():
+                    adabound_start_step.copy_(step)
 
         # Lastly, switch back to complex view
         if amsgrad and torch.is_complex(params[i]):
@@ -645,7 +765,10 @@ def _multi_tensor_adamcpr(
         exp_avg_sqs: List[Tensor],
         max_exp_avg_sqs: List[Tensor],
         lagmuls: List[Tensor],
+        lagmul_emas: List[Tensor],
         kappas: List[Tensor],
+        adabound_start_steps: List[Tensor],
+        min_kappas: List[Tensor],
         kappa_updates: List[Tensor],
         prev_regs: List[Tensor],
         prev_reg_gradients: List[Tensor],
@@ -663,6 +786,12 @@ def _multi_tensor_adamcpr(
         reg_function: str,
         reg_by_lr: bool,
         kappa_init_method: str,
+        adabound_method: str,
+        adabound_param: float,
+        adabound_smoothing: float,
+        adabound_eps: float,
+        adabound_reduce_while_inactive: bool,
+        train_steps: Optional[int],
         reg_step_size: int,
         reg_ema_decay: float,
         eps: float,
@@ -695,8 +824,8 @@ def _multi_tensor_adamcpr(
     assert grad_scale is None and found_inf is None
 
     grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
-        [params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, lagmuls, kappas, kappa_updates, prev_regs,
-         prev_reg_gradients, inflection_point_emas, state_steps]
+        [params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, lagmuls, lagmul_emas, kappas, adabound_start_steps, min_kappas,
+         kappa_updates, prev_regs, prev_reg_gradients, inflection_point_emas, state_steps]
     )
     for (
             device_params_,
@@ -705,7 +834,10 @@ def _multi_tensor_adamcpr(
             device_exp_avg_sqs_,
             device_max_exp_avg_sqs_,
             device_lagmuls_,
+            device_lagmul_emas_,
             device_kappas_,
+            device_adabound_start_steps_,
+            device_min_kappas_,
             device_kappa_updates_,
             device_prev_regs_,
             device_prev_reg_gradients_,
@@ -717,7 +849,10 @@ def _multi_tensor_adamcpr(
         device_exp_avgs = cast(List[Tensor], device_exp_avgs_)
         device_exp_avg_sqs = cast(List[Tensor], device_exp_avg_sqs_)
         device_lagmuls = cast(List[Tensor], device_lagmuls_)
+        device_lagmul_emas = cast(List[Tensor], device_lagmul_emas_)
         device_kappas = cast(List[Tensor], device_kappas_)
+        device_adabound_start_steps = cast(List[Tensor], device_adabound_start_steps_)
+        device_min_kappas = cast(List[Tensor], device_min_kappas_)
         device_kappa_updates = cast(List[Tensor], device_kappa_updates_)
         device_prev_regs = cast(List[Tensor], device_prev_regs_)
         device_prev_reg_gradients = cast(List[Tensor], device_prev_reg_gradients_)
@@ -734,7 +869,9 @@ def _multi_tensor_adamcpr(
                     device_exp_avg_sqs,
                     device_max_exp_avg_sqs,
                     device_lagmuls,
+                    device_lagmul_emas,
                     device_kappas,
+                    device_min_kappas,
                     device_kappa_updates,
                     device_prev_regs,
                     device_prev_reg_gradients,
@@ -747,7 +884,9 @@ def _multi_tensor_adamcpr(
                     device_exp_avgs,
                     device_exp_avg_sqs,
                     device_lagmuls,
+                    device_lagmul_emas,
                     device_kappas,
+                    device_min_kappas,
                     device_kappa_updates,
                     device_prev_regs,
                     device_prev_reg_gradients,
@@ -857,6 +996,7 @@ def _multi_tensor_adamcpr(
 
         if regularize:
             if device_state_steps[0] > warm_start:
+                # Apply regularization
                 if reg_function == 'l2':
                     square_sum_params = torch._foreach_pow(torch._foreach_norm(device_params), 2)
                     torch._foreach_sub_(square_sum_params, device_kappas)
@@ -928,6 +1068,56 @@ def _multi_tensor_adamcpr(
                 else:
                     raise ValueError(f"Unsupported regularization function: {reg_function}")
 
+                # Adapt Kappa
+                if any(s > d for s, d in zip(device_state_steps, device_adabound_start_steps)):
+                    if adabound_method == "reduce" or adabound_method == "reduce_factor":
+                        device_next_lagmul_emas = torch._foreach_mul(
+                            device_lagmul_emas, adabound_smoothing
+                        )
+                        torch._foreach_add_(device_next_lagmul_emas, device_lagmuls, alpha=1 - adabound_smoothing)
+                        for i in range(len(device_lagmul_emas)):
+                            if device_state_steps[i] > device_adabound_start_steps[i] and device_next_lagmul_emas[i] <= adabound_eps and (device_lagmul_emas[i] > adabound_eps or adabound_reduce_while_inactive):
+                                if adabound_method == "reduce_factor":
+                                    device_kappas[i].mul_(adabound_param)
+                                else:
+                                    old_kappa = device_kappas[i].clone()
+                                    single_initialize_kappa(device_kappas[i], device_params[i], reg_function)
+                                    device_kappas[i].sub_(old_kappa.sub(device_kappas[i]).mul(adabound_param - 1))
+                        torch._foreach_copy_(device_lagmul_emas, device_next_lagmul_emas)
+                    elif adabound_method == "cosine" or adabound_method == "cosine_init":
+                        device_cur_steps = torch._foreach_sub(device_state_steps, device_adabound_start_steps)
+                        device_tmax = torch._foreach_mul(device_adabound_start_steps, -1)
+                        torch._foreach_add_(device_tmax, train_steps)  # type: ignore (train_steps cannot be None here)
+                        device_factors = torch._foreach_div(
+                            torch._foreach_add(
+                                torch._foreach_cos(
+                                    torch._foreach_div(
+                                        torch._foreach_mul(device_cur_steps, torch.pi),
+                                        device_tmax,
+                                    ),
+                                ),
+                                1,
+                            ),
+                            torch._foreach_add(
+                                torch._foreach_cos(
+                                    torch._foreach_div(
+                                        torch._foreach_mul(
+                                            torch._foreach_sub(device_cur_steps, 1),
+                                            torch.pi),
+                                        device_tmax,
+                                    ),
+                                ),
+                                1,
+                            ),
+                        )
+                        # only decay after warm_start
+                        for i in range(len(device_adabound_start_steps)):
+                            if device_state_steps[i] < device_adabound_start_steps[i] or not device_factors[i].isfinite():
+                                device_factors[i].fill_(1.0)
+                        torch._foreach_sub_(device_kappas, device_min_kappas)
+                        torch._foreach_mul_(device_kappas, device_factors)
+                        torch._foreach_add_(device_kappas, device_min_kappas)
+
             if (kappa_init_method == 'inflection_point'
                     and any([device_kappa == HIGHKAPPA for device_kappa in device_kappas])):
 
@@ -952,6 +1142,11 @@ def _multi_tensor_adamcpr(
                             if device_prev_reg_gradients[i] > current_gradients[i] > 0.01 \
                                     and device_kappas[i] == HIGHKAPPA:
                                 single_initialize_kappa(device_kappas[i], device_params[i], reg_function)
+                                if adabound_method == "cosine":
+                                    single_initialize_kappa(device_min_kappas[i], device_params[i], reg_function)
+                                    device_min_kappas[i].mul_(adabound_param)
+                                if device_adabound_start_steps[i].isinf():
+                                    device_adabound_start_steps[i].copy_(device_state_steps[0])
 
                     if device_state_steps[0] > reg_step_size * 2:
                         torch._foreach_copy_(device_prev_reg_gradients, current_gradients)
@@ -978,6 +1173,14 @@ def _multi_tensor_adamcpr(
                                   param_abs, square_param in zip(abs_params, square_params)]
                     torch._foreach_add_(device_kappas, new_kappas)
 
+                if adabound_method == "cosine":
+                    torch._foreach_copy_(device_min_kappas, device_kappas)
+                    torch._foreach_mul_(device_min_kappas, adabound_param)
+
+                for i in range(len(device_adabound_start_steps)):
+                    if device_adabound_start_steps[i].isinf():
+                        device_adabound_start_steps[i].copy_(device_state_steps[0])
+
 
 @_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_adamcpr)
 def adamcpr(
@@ -987,7 +1190,10 @@ def adamcpr(
         exp_avg_sqs: List[Tensor],
         max_exp_avg_sqs: List[Tensor],
         lagmuls: List[Tensor],
+        lagmul_emas: List[Tensor],
         kappas: List[Tensor],
+        adabound_start_steps: List[Tensor],
+        min_kappas: List[Tensor],
         kappa_updates: List[Tensor],
         prev_regs: List[Tensor],
         prev_reg_gradients: List[Tensor],
@@ -1009,6 +1215,12 @@ def adamcpr(
         reg_function: str,
         reg_by_lr: bool,
         kappa_init_method: str,
+        adabound_method: str,
+        adabound_param: float,
+        adabound_smoothing: float,
+        adabound_eps: float,
+        adabound_reduce_while_inactive: bool,
+        train_steps: Optional[int],
         reg_step_size: int,
         reg_ema_decay: float,
         eps: float,
@@ -1051,7 +1263,10 @@ def adamcpr(
         exp_avg_sqs,
         max_exp_avg_sqs,
         lagmuls,
+        lagmul_emas,
         kappas,
+        adabound_start_steps,
+        min_kappas,
         kappa_updates,
         prev_regs,
         prev_reg_gradients,
@@ -1066,6 +1281,12 @@ def adamcpr(
         reg_function=reg_function,
         reg_by_lr=reg_by_lr,
         kappa_init_method=kappa_init_method,
+        adabound_method=adabound_method,
+        adabound_param=adabound_param,
+        adabound_smoothing=adabound_smoothing,
+        adabound_eps=adabound_eps,
+        adabound_reduce_while_inactive=adabound_reduce_while_inactive,
+        train_steps=train_steps,
         reg_step_size=reg_step_size,
         reg_ema_decay=reg_ema_decay,
         eps=eps,
